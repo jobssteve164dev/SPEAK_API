@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  tts-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - SECRET_KEY=your-secret-key-here
+    restart: unless-stopped 
