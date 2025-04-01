@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TTS管理系统</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>TTS管理系统</h1>
+            <form action="/logout" method="POST" style="display: inline;">
+                <button type="submit" class="logout-btn">退出登录</button>
+            </form>
+        </div>
+        
+        <form id="ttsForm">
+            <div class="form-group">
+                <label for="text">输入文本：</label>
+                <textarea id="text" name="text" rows="4" style="width: 100%;" required></textarea>
+            </div>
+            
+            <div class="form-group">
+                <label for="voice">选择语音：</label>
+                <select id="voice" name="voice" required>
+                    {% for voice in voices %}
+                    <option value="{{ voice['ShortName'] }}">{{ voice['LocalName'] }} ({{ voice['ShortName'] }})</option>
+                    {% endfor %}
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label for="rate">语速：</label>
+                <input type="range" id="rate" name="rate" min="-50" max="50" value="0">
+                <span id="rateValue">0%</span>
+            </div>
+            
+            <div class="form-group">
+                <label for="volume">音量：</label>
+                <input type="range" id="volume" name="volume" min="-50" max="50" value="0">
+                <span id="volumeValue">0%</span>
+            </div>
+            
+            <div class="form-group">
+                <label for="pitch">音调：</label>
+                <input type="range" id="pitch" name="pitch" min="-50" max="50" value="0">
+                <span id="pitchValue">0%</span>
+            </div>
+            
+            <button type="submit">生成语音</button>
+        </form>
+        
+        <audio id="audioPlayer" controls style="display: none;"></audio>
+    </div>
+
+    <script>
+        // 更新滑块值显示
+        document.querySelectorAll('input[type="range"]').forEach(input => {
+            input.addEventListener('input', function() {
+                document.getElementById(this.id + 'Value').textContent = this.value + '%';
+            });
+        });
+
+        // 处理表单提交
+        document.getElementById('ttsForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const formData = {
+                text: document.getElementById('text').value,
+                voice: document.getElementById('voice').value,
+                rate: document.getElementById('rate').value + '%',
+                volume: document.getElementById('volume').value + '%',
+                pitch: document.getElementById('pitch').value + '%'
+            };
+
+            try {
+                const response = await fetch('/tts', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(formData)
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    const audioPlayer = document.getElementById('audioPlayer');
+                    audioPlayer.src = 'data:audio/mp3;base64,' + data.audio;
+                    audioPlayer.style.display = 'block';
+                    audioPlayer.play();
+                } else {
+                    alert('生成语音失败，请重试');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('发生错误，请重试');
+            }
+        });
+    </script>
+</body>
+</html> 

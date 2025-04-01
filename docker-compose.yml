@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  tts-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      # 安全配置
+      - SECRET_KEY=your-secret-key-here
+      # 可选：访问令牌有效期（分钟）
+      - ACCESS_TOKEN_EXPIRE_MINUTES=30
+      # 可选：日志级别 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+      - LOG_LEVEL=INFO
+    restart: unless-stopped 
