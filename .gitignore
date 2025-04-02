@@ -39,5 +39,8 @@ logs/
 .DS_Store
 Thumbs.db 
 
+# 音频文件
+*.mp3
+
 # 测试生成的音频文件
 meditation_*.mp3 
