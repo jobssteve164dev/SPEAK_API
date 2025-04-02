@@ -1,7 +1,7 @@
 import edge_tts
 import asyncio
 import base64
-from typing import Optional, Dict, List, Any, Union
+from typing import Optional, Dict, List, Any, Union, Callable
 import logging
 from pydub import AudioSegment
 import io
@@ -17,6 +17,31 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("tts-sdk")
+
+# 添加事件通知系统
+class EventEmitter:
+    """简单的事件发射器，用于通知外部监听器SDK内部事件"""
+    
+    def __init__(self):
+        self._listeners = {}
+    
+    def on(self, event: str, callback: Callable) -> None:
+        """注册事件监听器"""
+        if event not in self._listeners:
+            self._listeners[event] = []
+        self._listeners[event].append(callback)
+    
+    def emit(self, event: str, *args, **kwargs) -> None:
+        """触发事件，并调用所有监听该事件的回调函数"""
+        if event in self._listeners:
+            for callback in self._listeners[event]:
+                try:
+                    callback(*args, **kwargs)
+                except Exception as e:
+                    logger.error(f"事件回调执行错误: {str(e)}")
+
+# 创建全局事件发射器
+events = EventEmitter()
 
 # 检查pydub和ffmpeg是否可用
 PYDUB_AVAILABLE = False
@@ -162,6 +187,10 @@ class TTSClient:
         
         # 使用pydub正确合并音频片段
         if len(results) > 1:
+            # 发出合并开始信号
+            events.emit("merge_start", len(results))
+            merge_start_time = time.time()
+            
             # 检查是否有任何空结果
             if any(not result for result in results):
                 logger.warning(f"警告：检测到{sum(1 for r in results if not r)}个空音频段")
@@ -169,6 +198,7 @@ class TTSClient:
             valid_results = [r for r in results if r and len(r) > 0]
             if not valid_results:
                 logger.error("错误：所有音频段都为空，无法处理")
+                events.emit("merge_end", 0, False)  # 发出合并结束信号（失败）
                 return b''
                 
             logger.info(f"有效音频段数量: {len(valid_results)}/{len(results)}")
@@ -207,12 +237,18 @@ class TTSClient:
                         combined.export(buffer, format="mp3", bitrate="128k")
                         all_audio_data = buffer.getvalue()
                         
-                        logger.info(f"音频合并成功: 总大小={len(all_audio_data)}字节, 估计时长={len(combined)/1000:.2f}秒")
+                        # 计算合并耗时并发出合并结束信号
+                        merge_time = time.time() - merge_start_time
+                        events.emit("merge_end", merge_time, True, len(all_audio_data))
+                        
+                        logger.info(f"音频合并成功: 总大小={len(all_audio_data)}字节, 估计时长={len(combined)/1000:.2f}秒, 合并耗时={merge_time:.2f}秒")
                         return all_audio_data
                     else:
                         logger.error("没有有效的音频段可以合并")
+                        events.emit("merge_end", time.time() - merge_start_time, False)
                 except Exception as e:
                     logger.error(f"音频合并过程中发生错误: {str(e)}", exc_info=True)
+                    events.emit("merge_end", time.time() - merge_start_time, False)
             
             # 如果无法使用pydub+ffmpeg，使用直接字节拼接
             logger.info("使用MP3直接字节拼接...")
@@ -235,10 +271,15 @@ class TTSClient:
                     else:
                         logger.warning(f"音频段 {i+1} 太小，无法安全拼接")
                 
-                logger.info(f"字节拼接完成: 总大小={len(all_audio_data)}字节")
+                # 计算合并耗时并发出合并结束信号
+                merge_time = time.time() - merge_start_time
+                events.emit("merge_end", merge_time, True, len(all_audio_data))
+                
+                logger.info(f"字节拼接完成: 总大小={len(all_audio_data)}字节, 合并耗时={merge_time:.2f}秒")
                 return all_audio_data
             except Exception as e:
                 logger.error(f"拼接过程中出错: {str(e)}")
+                events.emit("merge_end", time.time() - merge_start_time, False)
                 # 如果连基本拼接都失败，至少返回第一个有效结果
                 return valid_results[0]
         
@@ -484,4 +525,13 @@ def text_to_speech(
     return asyncio.run(async_text_to_speech(
         text, voice, rate, volume, pitch,
         enable_chunking, chunk_size, concurrency
-    )) 
+    ))
+
+# 添加一些辅助函数，允许外部代码监听事件
+def on_merge_start(callback: Callable) -> None:
+    """注册音频合并开始事件监听器"""
+    events.on("merge_start", callback)
+
+def on_merge_end(callback: Callable) -> None:
+    """注册音频合并结束事件监听器"""
+    events.on("merge_end", callback) 

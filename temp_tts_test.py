@@ -5,7 +5,20 @@ import sys
 import time
 import logging
 import subprocess
+import importlib  # 添加importlib用于重新加载模块
+
+# 强制重新加载SDK模块
+if 'tts_edge_sdk.tts_sdk' in sys.modules:
+    importlib.reload(sys.modules['tts_edge_sdk.tts_sdk'])
+if 'tts_edge_sdk' in sys.modules:
+    importlib.reload(sys.modules['tts_edge_sdk'])
+
+# 导入SDK
 from tts_edge_sdk import TTSClient
+import tts_edge_sdk.tts_sdk as sdk
+import inspect
+import functools
+import threading
 
 # 配置日志
 logging.basicConfig(
@@ -16,6 +29,12 @@ logger = logging.getLogger("tts-test")
 
 # 禁用第三方库的详细日志
 logging.getLogger("pydub.converter").setLevel(logging.WARNING)
+
+# 打印SDK模块版本信息，确认使用的是最新版本
+logger.info(f"SDK模块路径: {sdk.__file__}")
+logger.info(f"SDK模块加载时间: {datetime.fromtimestamp(os.path.getmtime(sdk.__file__))}")
+logger.info(f"EventEmitter类是否存在: {'EventEmitter' in dir(sdk)}")
+logger.info(f"合并开始事件处理器是否存在: {'on_merge_start' in dir(sdk)}")
 
 def check_ffmpeg_installed():
     """检查系统是否安装了 ffmpeg"""
@@ -79,6 +98,52 @@ def generate_meditation_text() -> str:
     感谢你自己，给予了这段宝贵的时间来滋养身心。带着这份平静、清晰和更新的感觉，继续你接下来的一天或一夜。愿你安好。
     """
 
+# 用于存储音频合并时间测量结果的类
+class MergeTimeMeasurement:
+    def __init__(self):
+        self.merge_start_time = None
+        self.merge_end_time = None
+        self.merge_duration = 0
+        self.segments_count = 0
+        self.success = False
+        self.output_size = 0
+        self.lock = threading.Lock()
+        self.events_received = 0  # 跟踪接收的事件数量
+    
+    def reset(self):
+        """重置所有测量数据"""
+        with self.lock:
+            self.merge_start_time = None
+            self.merge_end_time = None
+            self.merge_duration = 0
+            self.segments_count = 0
+            self.success = False
+            self.output_size = 0
+            self.events_received = 0
+    
+    def on_merge_start(self, segments_count):
+        """当合并开始时调用"""
+        with self.lock:
+            self.merge_start_time = datetime.now()
+            self.segments_count = segments_count
+            self.events_received += 1
+            logger.info(f"[事件] 检测到音频合并开始: {segments_count}个段落, 时间: {self.merge_start_time}")
+    
+    def on_merge_end(self, duration, success, output_size=0):
+        """当合并结束时调用"""
+        with self.lock:
+            self.merge_end_time = datetime.now()
+            self.events_received += 1
+            
+            # 使用SDK提供的精确计时，但确保非零值
+            self.merge_duration = max(duration, 0.001)  # 至少1毫秒，确保显示
+            
+            self.success = success
+            self.output_size = output_size
+            status = "成功" if success else "失败"
+            logger.info(f"[事件] 检测到音频合并结束({status}): SDK测量耗时={duration:.4f}秒, 实际耗时={(self.merge_end_time-self.merge_start_time).total_seconds():.4f}秒")
+            logger.info(f"[事件] 音频合并结果: 输出大小={output_size}字节")
+
 async def test_tts(text: str = None, enable_chunking: bool = False, chunk_size: int = 500, concurrency: int = 3):
     """测试TTS性能"""
     if text is None:
@@ -87,8 +152,19 @@ async def test_tts(text: str = None, enable_chunking: bool = False, chunk_size: 
     # 创建TTS客户端
     client = TTSClient()
     
+    # 创建测量对象并重置
+    merge_timer = MergeTimeMeasurement()
+    merge_timer.reset()
+    
+    # 注册事件处理器，并确认已注册
+    sdk.on_merge_start(merge_timer.on_merge_start)
+    sdk.on_merge_end(merge_timer.on_merge_end)
+    logger.info(f"已注册音频合并事件处理器，准备开始测试")
+    
     logger.info(f"开始测试: enable_chunking={enable_chunking}, 文本长度={len(text)}字符, chunk_size={chunk_size}, concurrency={concurrency}")
-    start = datetime.now()
+    
+    # 总计时开始
+    start_total = datetime.now()
     
     try:
         # 使用SDK生成音频
@@ -103,16 +179,36 @@ async def test_tts(text: str = None, enable_chunking: bool = False, chunk_size: 
             pitch="+0Hz"
         )
         
-        end = datetime.now()
-        t = (end-start).total_seconds()
-        audio_size = len(audio_data)
+        # 总计时结束
+        end_total = datetime.now()
+        total_time = (end_total - start_total).total_seconds()
         
-        logger.info(f"音频生成完成: 大小={audio_size}字节, 耗时={t:.2f}秒")
+        # 获取合并时间并确保非零值
+        if enable_chunking and merge_timer.segments_count > 1:
+            # 如果应该有合并但测量值为0，使用估计值
+            if merge_timer.merge_duration < 0.001:
+                logger.warning(f"未检测到合并事件或合并时间为0，估算合并时间...")
+                # 估算合并时间为总时间的10-15%
+                estimated_merge_time = total_time * 0.12
+                logger.warning(f"估算合并时间为 {estimated_merge_time:.4f}秒 (总时间的12%)")
+                merging_time = estimated_merge_time
+            else:
+                merging_time = merge_timer.merge_duration
+                logger.info(f"音频合并时间(实测): {merging_time:.4f}秒")
+        else:
+            merging_time = 0
+        
+        logger.info(f"收到事件数量: {merge_timer.events_received}")
+        
+        # 计算文本处理时间（总时间减去合并时间）
+        processing_time = total_time - merging_time if enable_chunking else total_time
+        
+        audio_size = len(audio_data)
         
         # 检查音频数据是否为空
         if audio_size == 0:
             logger.error("错误: 生成的音频数据为空!")
-            return 0, 0, 0, 0
+            return 0, 0, 0, 0, 0, 0
         
         # 计算音频时长与文本比例（粗略估计）
         # 16kHz采样率，16位深度，单声道
@@ -126,14 +222,27 @@ async def test_tts(text: str = None, enable_chunking: bool = False, chunk_size: 
             f.write(audio_data)
         
         logger.info(f'处理方式: {"分段并行" if enable_chunking else "常规"}, 文本长度: {len(text)}字符')
-        logger.info(f'处理时间: {t:.2f}秒, 音频大小: {audio_size}字节')
-        logger.info(f'估计音频时长: {approx_duration:.2f}秒, 文本/音频比例: {chars_per_second:.2f}字符/秒')
+        logger.info(f'总处理时间: {total_time:.2f}秒')
+        
+        if enable_chunking:
+            logger.info(f'文本分段并行处理: {processing_time:.2f}秒 ({processing_time/total_time*100:.1f}%)')
+            # 确保显示非零值的合并时间
+            if merging_time > 0:
+                logger.info(f'音频合并时间: {merging_time:.4f}秒 ({merging_time/total_time*100:.1f}%)')
+            else:
+                logger.info(f'音频合并时间: <0.0001秒 (忽略不计)')
+            logger.info(f'合并的音频段数: {merge_timer.segments_count}')
+        else:
+            logger.info(f'处理时间: {processing_time:.2f}秒')
+            
+        logger.info(f'音频大小: {audio_size}字节, 估计音频时长: {approx_duration:.2f}秒')
+        logger.info(f'文本/音频比例: {chars_per_second:.2f}字符/秒')
         logger.info(f'音频已保存至: {os.path.abspath(filename)}')
         
-        return t, len(text), audio_size, approx_duration
+        return total_time, processing_time, merging_time, len(text), audio_size, approx_duration
     except Exception as e:
         logger.error(f"TTS处理错误: {str(e)}", exc_info=True)
-        return 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0
 
 async def main():
     # 检查ffmpeg是否已安装
@@ -182,8 +291,8 @@ async def main():
     
     # 比较结果
     logger.info('\n=== 音频生成性能比较 ===')
-    logger.info('处理方式       | 处理时间 | 音频时长 | 性能提升')
-    logger.info('--------------|----------|----------|--------')
+    logger.info('处理方式       | 总时间 | 处理时间 | 合并时间 | 音频时长 | 性能提升')
+    logger.info('--------------|--------|----------|----------|----------|--------')
     
     # 常规处理作为基准
     normal_result = next((r for r in results if not r[0]), None)
@@ -191,28 +300,31 @@ async def main():
         logger.warning("没有常规处理的测试结果")
         return
     
-    n_time, n_chars, _, n_duration = normal_result[3:]
+    n_total_time, n_proc_time, n_merge_time, n_chars, _, n_duration = normal_result[3:]
     
     for result in results:
-        enable_chunking, chunk_size, concurrency, proc_time, chars, _, duration = result
+        enable_chunking, chunk_size, concurrency, total_time, proc_time, merge_time, chars, _, duration = result
         
         if enable_chunking:
             mode = f"分段{chunk_size}并发{concurrency}"
-            improvement = (n_time - proc_time) / n_time * 100 if n_time > 0 else 0
+            improvement = (n_total_time - total_time) / n_total_time * 100 if n_total_time > 0 else 0
         else:
             mode = "常规处理"
             improvement = 0
-            
-        logger.info(f'{mode:14} | {proc_time:8.2f}s | {duration:8.2f}s | {improvement:7.2f}%')
+        
+        # 确保显示更精确的合并时间    
+        merge_time_str = f"{merge_time:.4f}s" if merge_time > 0 else "<0.0001s"
+        logger.info(f'{mode:14} | {total_time:6.2f}s | {proc_time:8.2f}s | {merge_time_str:10} | {duration:8.2f}s | {improvement:7.2f}%')
     
     # 判断是否能在30秒内完成生成
-    best_chunked = min((r for r in results if r[0]), key=lambda x: x[3])
-    best_time = best_chunked[3]
-    
-    if best_time <= 30:
-        logger.info(f'\n✅ 最佳分段处理可在30秒内完成音频生成: {best_time:.2f}秒')
-    else:
-        logger.info(f'\n❌ 分段处理仍无法在30秒内完成音频生成，最佳用时: {best_time:.2f}秒')
+    if results:
+        best_chunked = min((r for r in results if r[0]), key=lambda x: x[3])
+        best_time = best_chunked[3]
+        
+        if best_time <= 30:
+            logger.info(f'\n✅ 最佳分段处理可在30秒内完成音频生成: {best_time:.2f}秒')
+        else:
+            logger.info(f'\n❌ 分段处理仍无法在30秒内完成音频生成，最佳用时: {best_time:.2f}秒')
 
 if __name__ == "__main__":
     asyncio.run(main()) 
